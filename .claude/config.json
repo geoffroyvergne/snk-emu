@@ -1,0 +1,13 @@
+{
+  "project": {
+    "name": "NeoGeo-Arcade-Emulator",
+    "language": "C++20",
+    "build_system": "CMake 3.20+",
+    "dependencies": [
+      "SDL2",
+      "SDL2_mixer"
+    ],
+    "architecture": "Modular: CPU (68000), Co-CPU (Z80), Video (NeoGeo Video Graphics), Audio (YM2610)"
+  }
+}
+
