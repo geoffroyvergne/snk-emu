@@ -4,9 +4,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
+#include "cart/CartridgeChip.hpp"
 #include "core/Endian.hpp"
 #include "core/RomFile.hpp"
 
@@ -17,6 +20,7 @@ class SoundSystem;
 class Upd4990a;
 class InterruptController;
 class VideoSystem;
+class Watchdog;
 
 // ROM images the bus knows how to load.
 enum class RomType : uint8_t {
@@ -60,6 +64,7 @@ public:
     static constexpr uint32_t kVectorTableSize = 0x80;
 
     MemoryBus();
+    ~MemoryBus();
 
     MemoryBus(const MemoryBus&)            = delete;
     MemoryBus& operator=(const MemoryBus&) = delete;
@@ -75,8 +80,19 @@ public:
     // Discards a ROM region (e.g. before loading another game; loads merge otherwise).
     void unloadRom(RomType type);
 
-    // Clears work/palette RAM and the system latch; keeps ROMs and backup RAM.
-    void reset();
+    // Custom cartridge logic (protection chip) decoding a window of the P ROM
+    // banked area; nullptr removes it. Owned by the bus, reset with it.
+    void attachCartridgeChip(std::unique_ptr<CartridgeChip> chip);
+    [[nodiscard]] const CartridgeChip* cartridgeChip() const noexcept { return cartChip_.get(); }
+    // Cartridge chips with their own bank switching (NEO-PVC): show the P ROM
+    // from `offset` (any byte offset in pRom) at 0x200000. The standard bank
+    // select (0x2FFFF0) or a reset returns to 1 MiB banks.
+    void setProgramBankBase(uint32_t offset) noexcept;
+
+    // Resets the system latch. A power-on reset also clears work/palette RAM;
+    // a hardware reset (watchdog) leaves RAM as it was, like the real board.
+    // ROMs and backup RAM are always kept.
+    void reset(bool clearRam = true);
 
     // ---- 68000 accesses ----------------------------------------------------
     // Reads are non-const: I/O reads can have side effects. Word/long accesses
@@ -103,6 +119,8 @@ public:
     void connectSound(SoundSystem* sound) noexcept { sound_ = sound; }
     // MVS calendar chip: written through 0x380051, read on REG_STATUS_A bits 6-7.
     void connectRtc(Upd4990a* rtc) noexcept { rtc_ = rtc; }
+    // Writes to 0x300001 (mirrored through 0x31FFFF) kick the watchdog.
+    void connectWatchdog(Watchdog* watchdog) noexcept { watchdog_ = watchdog; }
 
     // ---- Views for other chips --------------------------------------------
     [[nodiscard]] std::span<const uint8_t> fixRom() const noexcept;     // SFIX or S ROM, per latch
@@ -153,6 +171,8 @@ private:
     void writeLspc(uint32_t address, uint16_t value);
     void setCartridgeFix(bool cartridge) noexcept;
     void writeIoControl(uint8_t offset, uint8_t value);
+    [[nodiscard]] uint8_t bankedProgramByte(uint32_t address) const noexcept;
+    [[nodiscard]] std::optional<size_t> bankedProgramBase() const noexcept;
 
     std::array<Page, 256> pages_{};
     InterruptController*  irq_    = nullptr;
@@ -160,6 +180,8 @@ private:
     const InputPorts*     inputs_ = nullptr;
     SoundSystem*          sound_  = nullptr;
     Upd4990a*             rtc_    = nullptr;
+    Watchdog*             watchdog_ = nullptr;
+    std::unique_ptr<CartridgeChip> cartChip_;
 
     // Volatile memory.
     std::array<uint8_t, kWorkRamSize>          workRam_{};
@@ -177,6 +199,7 @@ private:
     bool    shadow_      = false;  // REG_SHADOW / REG_NOSHADOW
     uint8_t paletteBank_ = 0;      // REG_PALBANK0 / REG_PALBANK1
     uint8_t programBank_ = 0;      // P ROM bank at 0x200000
+    std::optional<uint32_t> programBankBase_;  // set by a cartridge chip: byte offset of the window
     uint32_t lastIoRead_ = kNoIoRead;
 };
 

@@ -12,22 +12,35 @@ System::System() : mainCpu_(bus_) {
     bus_.connectInputs(&inputs_);
     bus_.connectSound(&sound_);
     bus_.connectRtc(&rtc_);
+    bus_.connectWatchdog(&watchdog_);
     irq_.onLevelChanged([this](uint8_t level) { mainCpu_.setInterruptLevel(level); });
     video_.setTimerSyncHandler([this] { syncTimerToCpu(); });
     reset();
 }
 
 void System::reset() {
-    bus_.reset();      // restores BIOS vectors before the CPU fetches them
-    irq_.reset();
-    sound_.reset();
+    bus_.reset(/*clearRam=*/true);
     rtc_.reset(Upd4990a::hostLocalTime());  // the calendar starts at the host's local time
     rtcTickAccumulator_ = 0;
+    frameCount_         = 0;
+    watchdogResets_     = 0;
+    resetChips();
+}
+
+void System::hardwareReset() {
+    bus_.reset(/*clearRam=*/false);
+    resetChips();
+}
+
+void System::resetChips() {
+    // The bus is reset first: it restores the BIOS vectors the CPU fetches.
+    irq_.reset();
+    sound_.reset();
     mainCpu_.reset();
     video_.reset();
-    mainCycleBalance_  = 0;
-    frameCount_        = 0;
-    irq_.raise(Irq::ColdBoot);  // the BIOS expects and acknowledges this at power-on
+    watchdog_.reset();
+    mainCycleBalance_ = 0;
+    irq_.raise(Irq::ColdBoot);  // the BIOS expects and acknowledges this after every reset
 }
 
 void System::runFrame() {
@@ -75,6 +88,11 @@ void System::runScanline() {
         }
     }
     sound_.runScanline();
+
+    if (watchdogEnabled_ && watchdog_.advance(hw::kM68kCyclesPerLine)) {
+        ++watchdogResets_;
+        hardwareReset();
+    }
 
     // Calendar chip: 32.768 kHz crystal, advanced in exact integer steps
     // (one line = 384 pixels at 6 MHz = 2.097152 ticks).

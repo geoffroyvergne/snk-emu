@@ -7,6 +7,7 @@
 
 #include "audio/SoundSystem.hpp"
 #include "core/Interrupts.hpp"
+#include "core/Watchdog.hpp"
 #include "input/InputPorts.hpp"
 #include "rtc/Upd4990a.hpp"
 #include "video/VideoSystem.hpp"
@@ -81,15 +82,31 @@ MemoryBus::MemoryBus() {
     reset();
 }
 
-void MemoryBus::reset() {
-    workRam_.fill(0);
-    paletteRam_.fill(0);
+MemoryBus::~MemoryBus() = default;
+
+void MemoryBus::attachCartridgeChip(std::unique_ptr<CartridgeChip> chip) {
+    cartChip_ = std::move(chip);
+    if (cartChip_ != nullptr) {
+        cartChip_->reset();
+    }
+    mapBankedProgram();
+}
+
+void MemoryBus::reset(bool clearRam) {
+    if (clearRam) {
+        workRam_.fill(0);
+        paletteRam_.fill(0);
+    }
     biosVectors_ = true;
     setCartridgeFix(false);
     sramLocked_  = true;
     shadow_      = false;
     paletteBank_ = 0;
     programBank_ = 0;
+    programBankBase_.reset();
+    if (cartChip_ != nullptr) {
+        cartChip_->reset();
+    }
     mapAll();
 }
 
@@ -207,15 +224,47 @@ void MemoryBus::mapVectors() {
     pages_[0] = Page{vectorPage_.data(), nullptr, static_cast<uint32_t>(vectorPage_.size() - 1)};
 }
 
-void MemoryBus::mapBankedProgram() noexcept {
+// Byte offset in the P ROM shown at 0x200000, or nullopt when there is no
+// banked area (P ROM of 1 MiB or less).
+std::optional<size_t> MemoryBus::bankedProgramBase() const noexcept {
+    if (programBankBase_) {
+        return *programBankBase_;
+    }
     if (pRom_.data.size() <= kMiB) {
-        mapRange(0x20, 0x2F, nullptr, nullptr, 0);  // no P2: open bus
-        return;
+        return std::nullopt;
     }
     const size_t banks = (pRom_.data.size() - kMiB) / kMiB;
-    const size_t base  = kMiB + (programBank_ % banks) * kMiB;
+    return kMiB + (programBank_ % banks) * kMiB;
+}
+
+void MemoryBus::setProgramBankBase(uint32_t offset) noexcept {
+    programBankBase_ = offset;
+    mapBankedProgram();
+}
+
+void MemoryBus::mapBankedProgram() noexcept {
+    const std::optional<size_t> base = bankedProgramBase();
     // Reads are fast-path; writes stay on the slow path to catch bank selects.
-    mapRange(0x20, 0x2F, pRom_.data.data() + base, nullptr, kMiB - 1);
+    // 64 KiB pages past the end of the ROM fall to the slow path (open bus).
+    for (uint32_t page = 0; page < 0x10; ++page) {
+        const size_t offset = base ? *base + size_t{page} * 0x1'0000 : SIZE_MAX;
+        const bool   inside = base && offset + 0x1'0000 <= pRom_.data.size();
+        pages_[0x20 + page] = Page{inside ? pRom_.data.data() + offset : nullptr, nullptr, 0xFFFF};
+    }
+    if (cartChip_ != nullptr) {
+        // The chip's page goes through the slow path, which serves the chip
+        // window and falls back to the ROM for the rest of the page.
+        mapRange(cartChip_->firstAddress() >> 16, cartChip_->lastAddress() >> 16, nullptr, nullptr, 0);
+    }
+}
+
+uint8_t MemoryBus::bankedProgramByte(uint32_t address) const noexcept {
+    const std::optional<size_t> base = bankedProgramBase();
+    if (!base) {
+        return kOpenBus;
+    }
+    const size_t offset = *base + (address & (kMiB - 1));
+    return offset < pRom_.data.size() ? pRom_.data[offset] : kOpenBus;
 }
 
 void MemoryBus::mapPalette() noexcept {
@@ -235,6 +284,13 @@ void MemoryBus::mapBackupRam() noexcept {
 uint8_t MemoryBus::readSlow8(uint32_t address) {
     lastIoRead_ = address;
     const bool odd = (address & 1u) != 0;
+    if ((address & 0xF0'0000) == 0x20'0000) {  // banked area page shared with a cartridge chip
+        if (cartChip_ != nullptr && cartChip_->decodesRead(address)) {
+            const uint16_t word = cartChip_->read16(address & ~1u, *this);
+            return static_cast<uint8_t>(odd ? word : word >> 8);
+        }
+        return bankedProgramByte(address);
+    }
     switch (address >> 17) {
         case 0x300000 >> 17:
             // Address bit 7 selects REG_SYSTYPE (0x300081) over P1/DIP (0x300000/1).
@@ -272,6 +328,9 @@ uint8_t MemoryBus::readSlow8(uint32_t address) {
 
 uint16_t MemoryBus::readSlow16(uint32_t address) {
     lastIoRead_ = address;
+    if (cartChip_ != nullptr && cartChip_->decodesRead(address)) {
+        return cartChip_->read16(address, *this);  // one bus cycle: one chip access
+    }
     if ((address & 0xFE'0000) == 0x3C'0000) {
         return video_ ? video_->readRegister(address) : uint16_t{0xFFFF};
     }
@@ -280,7 +339,11 @@ uint16_t MemoryBus::readSlow16(uint32_t address) {
 }
 
 void MemoryBus::writeSlow8(uint32_t address, uint8_t value) {
-    if ((address & 0xFE'0000) == 0x3C'0000) {
+    if (cartChip_ != nullptr && cartChip_->decodesWrite(address)) {
+        const bool odd = (address & 1u) != 0;
+        cartChip_->write16(address & ~1u, odd ? uint16_t{value} : static_cast<uint16_t>(value << 8),
+                           odd ? uint16_t{0x00FF} : uint16_t{0xFF00}, *this);
+    } else if ((address & 0xFE'0000) == 0x3C'0000) {
         // LSPC registers are 16-bit. A byte write to the even address drives
         // the upper lane and the register stores that byte in both halves; a
         // byte write to the odd address (lower lane only) is not decoded.
@@ -289,9 +352,13 @@ void MemoryBus::writeSlow8(uint32_t address, uint8_t value) {
         }
     } else if ((address & 0xFF'FFF0) == 0x2F'FFF0) {
         programBank_ = static_cast<uint8_t>(value & 0x07);
+        programBankBase_.reset();
         mapBankedProgram();
     } else if ((address & 0xFE'0000) == 0x3A'0000 && (address & 1u) != 0) {
         writeSystemLatch(address);  // latch responds on the low byte lane only
+    }
+    else if ((address & 0xFE'0000) == 0x30'0000 && (address & 1u) != 0) {
+        if (watchdog_ != nullptr) watchdog_->kick();  // 0x300001: watchdog kick
     }
     else if ((address & 0xFE'0000) == 0x32'0000 && (address & 1u) == 0) {
         if (sound_ != nullptr) sound_->writeCommand(value);  // REG_SOUND: command to the Z80
@@ -303,6 +370,10 @@ void MemoryBus::writeSlow8(uint32_t address, uint8_t value) {
 }
 
 void MemoryBus::writeSlow16(uint32_t address, uint16_t value) {
+    if (cartChip_ != nullptr && cartChip_->decodesWrite(address)) {
+        cartChip_->write16(address, value, 0xFFFF, *this);
+        return;
+    }
     if ((address & 0xFE'0000) == 0x32'0000) {
         // REG_SOUND sits on the upper byte lane.
         if (sound_ != nullptr) sound_->writeCommand(static_cast<uint8_t>(value >> 8));

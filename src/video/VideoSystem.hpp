@@ -122,6 +122,15 @@ public:
 
     // ---- Rendering, driven by System ----------------------------------------
     void setRasterLine(uint32_t frameLine) noexcept { rasterLine_ = frameLine; }  // 0..263
+    // Cartridges with more than 128 KiB of fix tiles pick a 4 KiB-tile bank
+    // per row, from tables the game writes in VRAM (layout set per cartridge).
+    enum class FixBanking : uint8_t {
+        None,
+        Garou,    // Garou, Metal Slug 3/4/5: one bank per row, set by marker words at 0x7500/0x7580
+        Kof2000,  // KOF 2000/2003, SVC: 2 bits per tile in 0x7500-0x75FF
+    };
+    void setFixBanking(FixBanking banking) noexcept { fixBanking_ = banking; }
+
     // fixRom: SFIX or S ROM, whichever the system latch selects.
     void beginFrame(std::span<const uint8_t> fixRom);
     // paletteRam: the active 8 KiB bank (big-endian words), read live.
@@ -171,6 +180,7 @@ private:
 
     // Per-frame state.
     std::span<const uint8_t>      fixRom_;
+    FixBanking                    fixBanking_ = FixBanking::None;
     std::array<uint16_t, kWidth>  lineBuffer_{}; // palette index per pixel, 0 = transparent
     std::array<uint32_t, kWidth * kHeight> framebuffer_{};
 };

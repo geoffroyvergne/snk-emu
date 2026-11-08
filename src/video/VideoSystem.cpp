@@ -393,9 +393,35 @@ void VideoSystem::drawFix(uint32_t screenY) {
     const uint32_t row  = fy >> 3;
     const uint32_t line = fy & 7u;
 
+    // Only a cartridge fix ROM larger than 128 KiB is banked (the BIOS SFIX never is).
+    const bool banked = fixBanking_ != FixBanking::None && fixRom_.size() > 0x2'0000;
+    std::array<uint8_t, 32> garouBanks{};
+    if (banked && fixBanking_ == FixBanking::Garou) {
+        // A marker pair (0x0200 at 0x7500+k, 0xFFxx at 0x7580+k) switches the
+        // bank from that row on; each marker covers two rows (as MAME).
+        uint8_t  bank = 0;
+        uint32_t y    = 0;
+        for (uint32_t k = 0; y < 32; k += 2) {
+            if (vram_[0x7500 + k] == 0x0200 && (vram_[0x7580 + k] & 0xFF00) == 0xFF00) {
+                bank            = static_cast<uint8_t>(vram_[0x7580 + k] & 3);
+                garouBanks[y++] = bank;
+            }
+            if (y < 32) garouBanks[y++] = bank;
+        }
+    }
+
     for (uint32_t col = 0; col < kFixColumns; ++col) {
         const uint16_t entry = vram_[kFixMapBase + col * kFixRows + row];
-        const size_t   base  = size_t{entry & 0x0FFFu} * 32;
+        uint32_t       code  = entry & 0x0FFFu;
+        if (banked) {
+            if (fixBanking_ == FixBanking::Garou) {
+                code += 0x1000u * (garouBanks[(row - 2) & 31] ^ 3u);
+            } else {
+                const uint16_t bits = vram_[0x7500 + ((row - 1) & 31) + 32 * (col / 6)];
+                code += 0x1000u * (((bits >> ((5 - (col % 6)) * 2)) & 3u) ^ 3u);
+            }
+        }
+        const size_t base = (size_t{code} * 32) & (std::bit_ceil(fixRom_.size()) - 1);
         if (base + 32 > fixRom_.size()) {
             continue;
         }

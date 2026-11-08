@@ -99,6 +99,28 @@ run). Pads SDL doesn't recognise as game controllers are read as raw joysticks; 
 recognised, put [`gamecontrollerdb.txt`](https://github.com/mdqinc/SDL_GameControllerDB) in the
 same folder.
 
+## Game compatibility
+
+MAME sets load from a zip or a folder. Cartridges with custom hardware are
+recognised by the checksum of their first P ROM and handled automatically:
+
+| Hardware | Games | What is emulated |
+|---|---|---|
+| Protection chip | Metal Slug X | bit-stream protection at 0x2FFFE0 |
+| NEO-CMC42 + NEO-SMA | Metal Slug 3 | graphics/fix decryption; program decryption, `neo-sma` code, bank switching |
+| NEO-CMC50 + NEO-PCM2 | Metal Slug 4, Samurai Shodown V | graphics/fix, Z80 (M1) and sample decryption; program shuffle (SS5) |
+| NEO-PVC + CMC50 + PCM2 | Metal Slug 5, SNK vs. Capcom, KOF 2003 | all of the above, plus cartridge RAM, colour helpers and byte-granular bank switching |
+
+Decryption happens once, at load time (about a second). The algorithms in
+`src/cart/` are ported from MAME (`src/devices/bus/neogeo/`, BSD-3-Clause,
+S. Smith, David Haywood, Fabio Priuli). Other encrypted cartridges (KOF 99-2002,
+Garou, bootlegs such as `svcboot`...) are not supported yet: the loader rejects
+them with a message, or warns that P1 has no NEO-GEO header.
+
+The watchdog is emulated too: several games (Metal Slug 2/3, Last Blade,
+Blazing Star...) deliberately let it reset the machine once on first boot, and
+show a "WARNING ... ORIGINAL SNK BOARDS ONLY" screen on boards without one.
+
 ## Layout
 
 ```
@@ -112,6 +134,8 @@ src/
   main.cpp                       entry point, 60 FPS loop
   core/      System (owns the machine, scanline loop), Interrupts, Hardware constants, Endian helpers
   memory/    MemoryBus: 68000 address map, ROM loading (BIOS, SM1, SFIX, P, S)
+  cart/      Cartridge hardware: protection chips on the bus (Metal Slug X, NEO-PVC, NEO-SMA)
+             and load-time decryption (NEO-CMC graphics/M1, NEO-PCM2 samples, program ciphers)
   cpu/m68k/  Motorola 68000 @ 12 MHz: backend-agnostic wrapper over Musashi
   cpu/z80/   Zilog Z80 @ 4 MHz: wrapper over chips z80.h (cycle-stepped)
   rom/       RomLoader (game sets), BiosLoader (neogeo.zip), RomSource (zip/folder access)

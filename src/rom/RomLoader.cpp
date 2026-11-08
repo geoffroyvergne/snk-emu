@@ -9,6 +9,11 @@
 #include <miniz.h>
 
 #include "audio/SoundSystem.hpp"
+#include "cart/Cmc.hpp"
+#include "cart/Kof2k2Cipher.hpp"
+#include "cart/Pcm2.hpp"
+#include "cart/PvcProtection.hpp"
+#include "cart/SmaProtection.hpp"
 #include "core/Endian.hpp"
 #include "core/RomFile.hpp"
 #include "core/System.hpp"
@@ -78,13 +83,19 @@ Classification classifyName(std::string_view fileName) {
     if (dot == std::string::npos) {
         return {};
     }
-    if (const auto byExtension = classifyToken(std::string_view(lower).substr(dot + 1));
-        byExtension.role != RomRole::Unknown) {
-        return byExtension;
+    const std::string_view stem   = std::string_view(lower).substr(0, dot);
+    const size_t           dash   = stem.rfind('-');
+    const Classification   byStem = classifyToken(dash == std::string_view::npos ? stem : stem.substr(dash + 1));
+    const Classification   byExt  = classifyToken(std::string_view(lower).substr(dot + 1));
+    if (byExt.role == RomRole::Unknown) {
+        return byStem;
     }
-    const std::string_view stem = std::string_view(lower).substr(0, dot);
-    const size_t           dash = stem.rfind('-');
-    return classifyToken(dash == std::string_view::npos ? stem : stem.substr(dash + 1));
+    // "250-p2.ep1": the extension says "EPROM 1" but the stem holds the real
+    // position (P2). When both name the same role, the stem's number wins.
+    if (byStem.role == byExt.role) {
+        return byStem;
+    }
+    return byExt;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,6 +141,7 @@ void RomLoader::clear() noexcept {
     warnings_.clear();
     programWordSwapped_   = false;
     programHalvesSwapped_ = false;
+    cart_                 = nullptr;
 }
 
 void RomLoader::load(const fs::path& set, const fs::path& parent) {
@@ -153,10 +165,14 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
             for (const SourceEntry& entry : sources[s]->entries()) {
                 const Classification c = classifyName(entry.name);
                 if (c.role == RomRole::Unknown) {
-                    if (s == 0) warnings_.push_back("ignored unrecognized file: " + entry.name);
+                    if (s == 0 && !isSmaCodeName(entry.name)) warnings_.push_back("ignored unrecognized file: " + entry.name);
                     continue;
                 }
-                picks.try_emplace({c.role, c.index}, Pick{sources[s].get(), &entry, s != 0});
+                const auto [it, inserted] =
+                    picks.try_emplace({c.role, c.index}, Pick{sources[s].get(), &entry, s != 0});
+                if (!inserted && !it->second.fromParent && s == 0) {
+                    warnings_.push_back("ignored " + entry.name + ": same slot as " + it->second.entry->name);
+                }
             }
         }
         const auto collect = [&](RomRole role) {
@@ -198,10 +214,6 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
         if (sprites.empty()) {
             throw RomLoadError("no C sprite ROMs found (expected xxx-c1.c1, xxx-c2.c2, ...)");
         }
-        if (fixes.empty()) {
-            throw RomLoadError("no S1 fix ROM: this looks like a CMC-encrypted set (fix tiles stored in "
-                               "the C ROMs), which is not supported yet");
-        }
         if (adpcmA.empty()) {
             throw RomLoadError("no V sample ROMs found (expected xxx-v1.v1, ...)");
         }
@@ -218,9 +230,26 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
 
         // ---- P ROMs ----
         std::vector<uint8_t> p1 = readPick(RomRole::Program, 1, programs.front().second);
+        cart_ = cart::findCartridge(files_.back().crc32);  // custom hardware, keyed by the P1 dump
         if (p1.empty() || p1.size() % 2 != 0) {
             throw RomLoadError(programs.front().second.entry->name + ": P ROM size must be even");
         }
+        if (fixes.empty() && !(cart_ && cart_->gfx)) {
+            throw RomLoadError("no S1 fix ROM: this looks like a CMC-encrypted set (fix tiles stored in "
+                               "the C ROMs) that this emulator does not know yet");
+        }
+        if (cart_ && cart_->layout != cart::ProgramLayout::Standard) {
+            std::vector<std::vector<uint8_t>> rest;
+            for (size_t i = 1; i < programs.size(); ++i) {
+                rest.push_back(readPick(RomRole::Program, programs[i].first, programs[i].second));
+            }
+            std::vector<uint8_t> smaCode;
+            if (cart_->smaCode) {
+                smaCode = readSmaCode(sources);
+            }
+            pRom_ = assembleProgram(*cart_, std::move(p1), rest, smaCode);
+            programWordSwapped_ = true;
+        } else {
         HeaderLayout layout     = headerAt(p1, 0x100);
         bool         headerHigh = false;
         if (layout == HeaderLayout::NotFound && p1.size() >= 2 * kMiB) {
@@ -256,13 +285,19 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
             pRom_.resize(offset, 0xFF);
             pRom_.insert(pRom_.end(), px.begin(), px.end());
         }
+        }  // standard layout
         if (pRom_.size() > kMaxProgramSize) {
             throw RomLoadError("P ROMs total " + std::to_string(pRom_.size()) + " bytes, more than 9 MiB");
         }
 
         // ---- M, S ----
         mRom_ = readPick(RomRole::Music, musics.front().first, musics.front().second);
-        sRom_ = readPick(RomRole::Fix, fixes.front().first, fixes.front().second);
+        if (cart_ && cart_->m1Encrypted) {
+            mRom_ = cart::cmc::decryptM1(mRom_);
+        }
+        if (!fixes.empty()) {
+            sRom_ = readPick(RomRole::Fix, fixes.front().first, fixes.front().second);
+        }
         if (musics.size() > 1 || fixes.size() > 1) {
             warnings_.push_back("more than one M or S ROM; only the first of each is used");
         }
@@ -278,6 +313,9 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
             }
             cRoms_.push_back(std::move(pair));
         }
+        if (cart_ && cart_->gfx) {
+            decryptSprites(*cart_);  // also rebuilds the fix ROM from the C data
+        }
 
         // ---- V: concatenated in file order ----
         const auto concat = [&](RomRole role, const auto& list, std::vector<uint8_t>& out) {
@@ -288,6 +326,14 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
         };
         concat(RomRole::AdpcmA, adpcmA, vRomA_);
         concat(RomRole::AdpcmB, adpcmB, vRomB_);
+        if (cart_ && cart_->samples == cart::SampleCipher::Pcm2Decrypt) {
+            cart::pcm2::decrypt(vRomA_, cart_->sampleParam);
+        } else if (cart_ && cart_->samples == cart::SampleCipher::Pcm2Swap) {
+            if (vRomA_.size() < 0x100'0000) {
+                throw RomLoadError("NEO-PCM2: expected 16 MiB of V ROMs, found " + std::to_string(vRomA_.size()));
+            }
+            cart::pcm2::swap(vRomA_, cart_->sampleParam);
+        }
     } catch (const SourceError& e) {
         const std::string message = e.what();
         clear();
@@ -296,6 +342,128 @@ void RomLoader::load(const fs::path& set, const fs::path& parent) {
         const std::string message = set.string() + ": " + e.what();
         clear();
         throw RomLoadError(message);
+    }
+}
+
+// Program image of an encrypted cartridge. Like every P ROM dump the files are
+// word-swapped: each is turned into 68000 byte order first, placed where
+// MAME's ROM definition puts it, then decrypted. MAME's routines work on that
+// byte order (checked: the results carry the NEO-GEO header and valid vectors).
+std::vector<uint8_t> RomLoader::assembleProgram(const cart::CartridgeInfo& info, std::vector<uint8_t> p1,
+                                                const std::vector<std::vector<uint8_t>>& rest,
+                                                std::vector<uint8_t> smaCode) {
+    const std::string name = info.setName;
+    std::vector<uint8_t> image(info.programRegionSize, 0);
+    const auto place = [&](std::vector<uint8_t> data, size_t at, const char* what) {
+        endian::swap_words_in_place(data);
+        if (at + data.size() > image.size()) {
+            throw RomLoadError(name + ": " + what + " does not fit the " +
+                               std::to_string(image.size() / kMiB) + " MiB program image");
+        }
+        std::copy(data.begin(), data.end(), image.begin() + static_cast<std::ptrdiff_t>(at));
+    };
+
+    if (info.layout == cart::ProgramLayout::Interleaved32) {
+        // P1/P2 alternate word by word (MAME ROM_LOAD32_WORD_SWAP), optional P3 at 0x800000.
+        if (rest.empty() || rest[0].size() != p1.size() || 2 * p1.size() > image.size()) {
+            throw RomLoadError(name + ": expected P1 and P2 of the same size (" +
+                               std::to_string(info.programRegionSize / 2 / kMiB) + " MiB each)");
+        }
+        std::vector<uint8_t> p2 = rest[0];
+        endian::swap_words_in_place(p1);
+        endian::swap_words_in_place(p2);
+        for (size_t w = 0; w < p1.size() / 2; ++w) {
+            image[4 * w + 0] = p1[2 * w];
+            image[4 * w + 1] = p1[2 * w + 1];
+            image[4 * w + 2] = p2[2 * w];
+            image[4 * w + 3] = p2[2 * w + 1];
+        }
+        if (rest.size() > 1) {
+            place(rest[1], 2 * p1.size(), "P3");
+        }
+    } else {  // Linear
+        size_t at = info.programStart;
+        const size_t p1Size = p1.size();
+        place(std::move(p1), at, "P1");
+        at += p1Size;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            place(rest[i], at, "P2+");
+            at += rest[i].size();
+        }
+    }
+    if (info.smaCode) {
+        if (smaCode.size() != 0x4'0000) {
+            throw RomLoadError(name + ": the neo-sma dump (SMA chip code) must be 256 KiB");
+        }
+        place(std::move(smaCode), 0x0C'0000, "neo-sma");
+    }
+
+    switch (info.program) {
+        case cart::ProgramCipher::PvcMslug5:  PvcProtection::decryptMslug5(image); break;
+        case cart::ProgramCipher::PvcSvc:     PvcProtection::decryptSvc(image); break;
+        case cart::ProgramCipher::PvcKof2003: PvcProtection::decryptKof2003(image); break;
+        case cart::ProgramCipher::Samsho5:    cart::kof2k2::decryptSamsho5(image); break;
+        case cart::ProgramCipher::SmaMslug3:  SmaMslug3Protection::decrypt(image); break;
+        case cart::ProgramCipher::None:       break;
+    }
+    if (headerAt(image, 0x100) != HeaderLayout::BigEndian) {
+        throw RomLoadError(name + ": program decryption produced no NEO-GEO header (different dump of the set?)");
+    }
+    return image;
+}
+
+// The SMA chip's internal code, dumped as "neo-sma" (MAME: green.neo-sma).
+bool RomLoader::isSmaCodeName(const std::string& fileName) {
+    const std::string lower = toLower(fileName);
+    return lower.size() >= 7 && lower.compare(lower.size() - 7, 7, "neo-sma") == 0;
+}
+
+std::vector<uint8_t> RomLoader::readSmaCode(const std::vector<std::unique_ptr<RomSource>>& sources) {
+    for (const auto& source : sources) {
+        for (const SourceEntry& entry : source->entries()) {
+            if (isSmaCodeName(entry.name)) {
+                return source->read(entry);
+            }
+        }
+    }
+    throw RomLoadError("missing neo-sma (the SMA chip's code, e.g. green.neo-sma)");
+}
+
+// CMC: rebuild MAME's sprite region (C1 even bytes, C2 odd bytes, pair after
+// pair), decrypt it, take the fix tiles from its end, split it back into pairs.
+void RomLoader::decryptSprites(const cart::CartridgeInfo& info) {
+    std::vector<size_t> pairSizes;
+    size_t total = 0;
+    for (const SpriteRomPair& pair : cRoms_) {
+        pairSizes.push_back(pair.odd.size());
+        total += 2 * pair.odd.size();
+    }
+    std::vector<uint8_t> region(total);
+    size_t at = 0;
+    for (SpriteRomPair& pair : cRoms_) {
+        for (size_t i = 0; i < pair.odd.size(); ++i) {
+            region[at + 2 * i]     = pair.odd[i];
+            region[at + 2 * i + 1] = pair.even[i];
+        }
+        at += 2 * pair.odd.size();
+        pair.odd  = {};  // free as we go: the decryption needs a second full copy
+        pair.even = {};
+    }
+
+    cart::cmc::decryptSprites(region, *info.gfx, info.gfxKey);
+    sRom_ = cart::cmc::extractFix(region, info.fixSize);
+
+    at = 0;
+    for (size_t p = 0; p < cRoms_.size(); ++p) {
+        SpriteRomPair& pair = cRoms_[p];
+        const size_t   size = pairSizes[p];
+        pair.odd.resize(size);
+        pair.even.resize(size);
+        for (size_t i = 0; i < size; ++i) {
+            pair.odd[i]  = region[at + 2 * i];
+            pair.even[i] = region[at + 2 * i + 1];
+        }
+        at += 2 * size;
     }
 }
 
@@ -308,6 +476,7 @@ void RomLoader::install(System& system) const {
     bus.unloadRom(RomType::SRom);
     bus.loadRom(RomType::PRom, pRom_, 0, RomByteOrder::BigEndian);  // already normalized
     bus.loadRom(RomType::SRom, sRom_);
+    bus.attachCartridgeChip(makeCartridgeChip(cartridgeChip()));
 
     SoundSystem& sound = system.sound();
     sound.unloadRom(SoundRom::M1);
@@ -320,6 +489,7 @@ void RomLoader::install(System& system) const {
     }
 
     VideoSystem& video = system.video();
+    video.setFixBanking(cart_ ? cart_->fixBanking : VideoSystem::FixBanking::None);
     video.clearSpriteRoms();
     for (const SpriteRomPair& pair : cRoms_) {
         video.addSpriteRomPair(pair.odd, pair.even);

@@ -28,6 +28,15 @@ LoadResult load(const fs::path& path, std::span<uint8_t> ram) {
     return LoadResult::Loaded;
 }
 
+std::optional<fs::file_time_type> modificationTime(const fs::path& path) {
+    std::error_code ec;
+    const auto time = fs::last_write_time(path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    return time;
+}
+
 void save(const fs::path& path, std::span<const uint8_t> ram) {
     std::vector<uint8_t> file(ram.size());
     for (size_t i = 0; i < ram.size(); ++i) {

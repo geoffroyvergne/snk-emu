@@ -3,13 +3,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "cart/CartridgeDb.hpp"
+
 namespace snk {
 
 class System;
+namespace romsrc { class RomSource; }
 
 // What a file of a game set holds, decided from its MAME-style name.
 enum class RomRole : uint8_t {
@@ -78,11 +82,24 @@ public:
     [[nodiscard]] bool programWasWordSwapped() const noexcept { return programWordSwapped_; }
     [[nodiscard]] bool programHalvesSwapped() const noexcept { return programHalvesSwapped_; }
     [[nodiscard]] bool loaded() const noexcept { return !pRom_.empty(); }
+    // Custom cartridge hardware the set needs (identified by its P1 CRC).
+    [[nodiscard]] CartridgeChipType cartridgeChip() const noexcept {
+        return cart_ ? cart_->chip : CartridgeChipType::None;
+    }
+    // Encryption / protection description of the set, nullptr for a plain cartridge.
+    [[nodiscard]] const cart::CartridgeInfo* cartridge() const noexcept { return cart_; }
 
     // Replaces the game ROMs of `system` (BIOS untouched) and resets it.
     void install(System& system) const;
 
 private:
+    static std::vector<uint8_t> assembleProgram(const cart::CartridgeInfo& info, std::vector<uint8_t> p1,
+                                                const std::vector<std::vector<uint8_t>>& rest,
+                                                std::vector<uint8_t> smaCode);
+    static bool isSmaCodeName(const std::string& fileName);
+    static std::vector<uint8_t> readSmaCode(const std::vector<std::unique_ptr<romsrc::RomSource>>& sources);
+    void decryptSprites(const cart::CartridgeInfo& info);
+
     std::string                setName_;
     std::vector<uint8_t>       pRom_, mRom_, sRom_, vRomA_, vRomB_;
     std::vector<SpriteRomPair> cRoms_;
@@ -90,6 +107,7 @@ private:
     std::vector<std::string>   warnings_;
     bool                       programWordSwapped_   = false;
     bool                       programHalvesSwapped_ = false;
+    const cart::CartridgeInfo* cart_                 = nullptr;
 };
 
 }  // namespace snk

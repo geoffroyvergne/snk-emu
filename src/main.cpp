@@ -118,6 +118,9 @@ BootInfo bootFromRoms(const Options& options, snk::System& system) {
         }
         for (const auto& w : game.warnings()) SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Game: %s", w.c_str());
         game.install(system);  // loader buffers are freed when `game` goes out of scope
+        if (const snk::CartridgeChip* chip = system.memory().cartridgeChip()) {
+            SDL_Log("Game: cartridge hardware: %s", chip->name());
+        }
         title   = "SNK Emu - " + game.setName();
         setName = game.setName();
     }
@@ -150,6 +153,7 @@ int run(const Options& options) {
     // With ROMs: boot them. Without: drive the video pipeline with a synthetic scene.
     std::optional<snk::TestScene> scene;
     std::filesystem::path         nvram;
+    std::optional<std::filesystem::file_time_type> nvramTime;  // file's timestamp when loaded
     if (!options.bios.empty()) {
         const BootInfo boot = bootFromRoms(options, *system);
         config.title = boot.title;
@@ -158,7 +162,8 @@ int run(const Options& options) {
         // Battery-backed RAM: with valid contents the BIOS skips its destructive
         // backup-RAM test at power-on (about 0.66 s), as on a real MVS.
         if (options.nvram) {
-            nvram = nvramPath(boot.setName);
+            nvram     = nvramPath(boot.setName);
+            nvramTime = snk::backup_ram::modificationTime(nvram);
             switch (snk::backup_ram::load(nvram, system->memory().backupRam())) {
                 case snk::backup_ram::LoadResult::Loaded:
                     SDL_Log("NVRAM: loaded %s", nvram.string().c_str()); break;
@@ -169,6 +174,7 @@ int run(const Options& options) {
             }
         }
     } else {
+        system->setWatchdogEnabled(false);  // no 68000 program runs to kick it
         scene.emplace(*system);
     }
     bool biosVectors = system->memory().biosVectorsMapped();
@@ -179,6 +185,7 @@ int run(const Options& options) {
     uint64_t fpsTimer  = SDL_GetTicks64();
     uint32_t fpsFrames = 0;
 
+    uint32_t watchdogResets = 0;
     while (platform.pollEvents([&](const SDL_Event& e) { input.handleEvent(e); })) {
         // Latch this frame's controls into the machine's input registers.
         system->inputs().setState(input.sample());
@@ -191,6 +198,10 @@ int run(const Options& options) {
             SDL_Log("Frame %llu: %s vector table mapped (PC=%06X)",
                     static_cast<unsigned long long>(system->frameCount()), mapped ? "BIOS" : "cartridge",
                     system->mainCpu().pc());
+        }
+        if (const uint32_t resets = system->watchdogResets(); resets != watchdogResets) {
+            watchdogResets = resets;
+            SDL_Log("Frame %llu: watchdog reset (#%u)", static_cast<unsigned long long>(system->frameCount()), resets);
         }
         audio.push(system->audioSamples());
         platform.present(system->framebuffer());
@@ -224,8 +235,17 @@ int run(const Options& options) {
     SDL_Log("68000: PC=%06X SR=%04X, last I/O read: %s", system->mainCpu().pc(), system->mainCpu().sr(), lastIoText);
     if (!nvram.empty()) {
         try {
-            snk::backup_ram::save(nvram, system->memory().backupRam());
-            SDL_Log("NVRAM: saved %s", nvram.string().c_str());
+            // Never overwrite a file that changed on disk while we were running
+            // (another instance saved it, or it was repaired): keep ours aside.
+            std::filesystem::path target = nvram;
+            if (snk::backup_ram::modificationTime(nvram) != nvramTime) {
+                target += ".unsaved";
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "NVRAM: %s changed on disk since it was loaded; keeping it, this session's data goes to %s",
+                            nvram.string().c_str(), target.string().c_str());
+            }
+            snk::backup_ram::save(target, system->memory().backupRam());
+            SDL_Log("NVRAM: saved %s", target.string().c_str());
         } catch (const std::exception& e) {
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "NVRAM: %s", e.what());
         }

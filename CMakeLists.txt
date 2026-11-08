@@ -60,6 +60,14 @@ add_library(snkemu_core STATIC
     src/core/System.cpp
     src/core/BackupRamFile.cpp
     src/memory/MemoryBus.cpp
+    src/cart/CartridgeChip.cpp
+    src/cart/MslugXProtection.cpp
+    src/cart/PvcProtection.cpp
+    src/cart/Cmc.cpp
+    src/cart/Pcm2.cpp
+    src/cart/CartridgeDb.cpp
+    src/cart/SmaProtection.cpp
+    src/cart/Kof2k2Cipher.cpp
     src/cpu/m68k/M68000.cpp
     src/cpu/z80/Z80.cpp
     src/video/VideoSystem.cpp
